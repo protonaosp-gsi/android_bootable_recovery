@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018 The Android Open Source Project
+ * Copyright (C) 2019 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,9 +14,17 @@
  * limitations under the License.
  */
 
-#ifndef _FILESYSTEM_CMDS_H
-#define _FILESYSTEM_CMDS_H
+#pragma once
 
-bool do_fsck_unshare_blocks();
+#include "recovery_ui/device.h"
 
-#endif  // _FILESYSTEM_CMDS_H
+bool FinishPendingSnapshotMerges(Device* device);
+
+/*
+ * This function tries to create the snapshotted devices in the case a Virtual
+ * A/B device is updating.
+ * The function returns false in case of critical failure that would prevent
+ * the further mountings of devices, or true in case of success, if either the
+ * devices were created or there was no need to.
+ */
+bool CreateSnapshotPartitions();
