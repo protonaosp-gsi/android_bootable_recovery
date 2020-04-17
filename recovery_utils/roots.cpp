@@ -157,8 +157,8 @@ int format_volume(const std::string& volume, const std::string& directory) {
   bool needs_projid = false;
 
   if (volume == "/data") {
-    needs_casefold = android::base::GetBoolProperty("ro.emulated_storage.casefold", false);
-    needs_projid = android::base::GetBoolProperty("ro.emulated_storage.projid", false);
+    needs_casefold = android::base::GetBoolProperty("external_storage.casefold.enabled", false);
+    needs_projid = android::base::GetBoolProperty("external_storage.projid.enabled", false);
   }
 
   // If there's a key_loc that looks like a path, it should be a block device for storing encryption
@@ -258,6 +258,12 @@ int format_volume(const std::string& volume, const std::string& directory) {
     make_f2fs_cmd.push_back("casefold");
     make_f2fs_cmd.push_back("-C");
     make_f2fs_cmd.push_back("utf8");
+  }
+  if (v->fs_mgr_flags.fs_compress) {
+    make_f2fs_cmd.push_back("-O");
+    make_f2fs_cmd.push_back("compression");
+    make_f2fs_cmd.push_back("-O");
+    make_f2fs_cmd.push_back("extra_attr");
   }
   make_f2fs_cmd.push_back(v->blk_device);
   if (length >= kSectorSize) {
