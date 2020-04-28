@@ -18,9 +18,11 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <getopt.h>
 #include <inttypes.h>
 #include <limits.h>
+#include <linux/fs.h>
 #include <linux/input.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -28,8 +30,8 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <functional>
-#include <iterator>
 #include <memory>
 #include <string>
 #include <vector>
@@ -40,27 +42,27 @@
 #include <android-base/properties.h>
 #include <android-base/stringprintf.h>
 #include <android-base/strings.h>
+#include <android-base/unique_fd.h>
+#include <bootloader_message/bootloader_message.h>
 #include <cutils/properties.h> /* for property_list */
-#include <fs_mgr/roots.h>
+#include <healthhalutils/HealthHalUtils.h>
 #include <ziparchive/zip_archive.h>
 
-#include "bootloader_message/bootloader_message.h"
+#include "common.h"
 #include "fsck_unshare_blocks.h"
+#include "fuse_sideload.h"
 #include "install/adb_install.h"
-#include "install/fuse_install.h"
+#include "install/fuse_sdcard_install.h"
 #include "install/install.h"
 #include "install/package.h"
 #include "install/wipe_data.h"
-#include "install/wipe_device.h"
-#include "otautil/boot_state.h"
 #include "otautil/error_code.h"
+#include "otautil/logging.h"
 #include "otautil/paths.h"
+#include "otautil/roots.h"
 #include "otautil/sysutil.h"
 #include "recovery_ui/screen_ui.h"
 #include "recovery_ui/ui.h"
-#include "recovery_utils/battery_utils.h"
-#include "recovery_utils/logging.h"
-#include "recovery_utils/roots.h"
 
 static constexpr const char* COMMAND_FILE = "/cache/recovery/command";
 static constexpr const char* LAST_KMSG_FILE = "/cache/recovery/last_kmsg";
@@ -69,7 +71,13 @@ static constexpr const char* LOCALE_FILE = "/cache/recovery/last_locale";
 
 static constexpr const char* CACHE_ROOT = "/cache";
 
+// We define RECOVERY_API_VERSION in Android.mk, which will be picked up by build system and packed
+// into target_files.zip. Assert the version defined in code and in Android.mk are consistent.
+static_assert(kRecoveryApiVersion == RECOVERY_API_VERSION, "Mismatching recovery API versions.");
+
 static bool save_current_log = false;
+std::string stage;
+const char* reason = nullptr;
 
 /*
  * The recovery tool communicates with the main system through /cache files.
@@ -78,8 +86,6 @@ static bool save_current_log = false;
  *
  * The arguments which may be supplied in the recovery.command file:
  *   --update_package=path - verify install an OTA package file
- *   --install_with_fuse - install the update package with FUSE. This allows installation of large
- *       packages on LP32 builds. Since the mmap will otherwise fail due to out of memory.
  *   --wipe_data - erase user data (and cache), then reboot
  *   --prompt_and_wipe_data - prompt the user that data is corrupt, with their consent erase user
  *       data (and cache), then reboot
@@ -100,7 +106,7 @@ static bool save_current_log = false;
  *    -- after this, rebooting will restart the erase --
  * 5. erase_volume() reformats /data
  * 6. erase_volume() reformats /cache
- * 7. FinishRecovery() erases BCB
+ * 7. finish_recovery() erases BCB
  *    -- after this, rebooting will restart the main system --
  * 8. main() calls reboot() to boot main system
  *
@@ -110,27 +116,27 @@ static bool save_current_log = false;
  * 3. main system reboots into recovery
  * 4. get_args() writes BCB with "boot-recovery" and "--update_package=..."
  *    -- after this, rebooting will attempt to reinstall the update --
- * 5. InstallPackage() attempts to install the update
+ * 5. install_package() attempts to install the update
  *    NOTE: the package install must itself be restartable from any point
- * 6. FinishRecovery() erases BCB
+ * 6. finish_recovery() erases BCB
  *    -- after this, rebooting will (try to) restart the main system --
  * 7. ** if install failed **
- *    7a. PromptAndWait() shows an error icon and waits for the user
+ *    7a. prompt_and_wait() shows an error icon and waits for the user
  *    7b. the user reboots (pulling the battery, etc) into the main system
  */
 
-static bool IsRoDebuggable() {
-  return android::base::GetBoolProperty("ro.debuggable", false);
+bool is_ro_debuggable() {
+    return android::base::GetBoolProperty("ro.debuggable", false);
 }
 
 // Clear the recovery command and prepare to boot a (hopefully working) system,
 // copy our log file to cache as well (for the system to read). This function is
 // idempotent: call it as many times as you like.
-static void FinishRecovery(RecoveryUI* ui) {
+static void finish_recovery() {
   std::string locale = ui->GetLocale();
   // Save the locale to cache, so if recovery is next started up without a '--locale' argument
   // (e.g., directly from the bootloader) it will use the last-known locale.
-  if (!locale.empty() && HasCache()) {
+  if (!locale.empty() && has_cache) {
     LOG(INFO) << "Saving locale \"" << locale << "\"";
     if (ensure_path_mounted(LOCALE_FILE) != 0) {
       LOG(ERROR) << "Failed to mount " << LOCALE_FILE;
@@ -139,7 +145,7 @@ static void FinishRecovery(RecoveryUI* ui) {
     }
   }
 
-  copy_logs(save_current_log);
+  copy_logs(save_current_log, has_cache, sehandle);
 
   // Reset to normal system boot so recovery won't cycle indefinitely.
   std::string err;
@@ -148,7 +154,7 @@ static void FinishRecovery(RecoveryUI* ui) {
   }
 
   // Remove the command file, so recovery won't repeat indefinitely.
-  if (HasCache()) {
+  if (has_cache) {
     if (ensure_path_mounted(COMMAND_FILE) != 0 || (unlink(COMMAND_FILE) && errno != ENOENT)) {
       LOG(WARNING) << "Can't unlink " << COMMAND_FILE;
     }
@@ -162,7 +168,7 @@ static bool yes_no(Device* device, const char* question1, const char* question2)
   std::vector<std::string> headers{ question1, question2 };
   std::vector<std::string> items{ " No", " Yes" };
 
-  size_t chosen_item = device->GetUI()->ShowMenu(
+  size_t chosen_item = ui->ShowMenu(
       headers, items, 0, true,
       std::bind(&Device::HandleMenuKey, device, std::placeholders::_1, std::placeholders::_2));
   return (chosen_item == 1);
@@ -172,7 +178,7 @@ static bool ask_to_wipe_data(Device* device) {
   std::vector<std::string> headers{ "Wipe all user data?", "  THIS CAN NOT BE UNDONE!" };
   std::vector<std::string> items{ " Cancel", " Factory data reset" };
 
-  size_t chosen_item = device->GetUI()->ShowPromptWipeDataConfirmationMenu(
+  size_t chosen_item = ui->ShowPromptWipeDataConfirmationMenu(
       headers, items,
       std::bind(&Device::HandleMenuKey, device, std::placeholders::_1, std::placeholders::_2));
 
@@ -194,7 +200,7 @@ static InstallResult prompt_and_wipe_data(Device* device) {
   };
   // clang-format on
   for (;;) {
-    size_t chosen_item = device->GetUI()->ShowPromptWipeDataMenu(
+    size_t chosen_item = ui->ShowPromptWipeDataMenu(
         wipe_data_menu_headers, wipe_data_menu_items,
         std::bind(&Device::HandleMenuKey, device, std::placeholders::_1, std::placeholders::_2));
     // If ShowMenu() returned RecoveryUI::KeyError::INTERRUPTED, WaitKey() was interrupted.
@@ -206,8 +212,7 @@ static InstallResult prompt_and_wipe_data(Device* device) {
     }
 
     if (ask_to_wipe_data(device)) {
-      CHECK(device->GetReason().has_value());
-      bool convert_fbe = device->GetReason().value() == "convert_fbe";
+      bool convert_fbe = reason && strcmp(reason, "convert_fbe") == 0;
       if (WipeData(device, convert_fbe)) {
         return INSTALL_SUCCESS;
       } else {
@@ -217,9 +222,168 @@ static InstallResult prompt_and_wipe_data(Device* device) {
   }
 }
 
+// Secure-wipe a given partition. It uses BLKSECDISCARD, if supported. Otherwise, it goes with
+// BLKDISCARD (if device supports BLKDISCARDZEROES) or BLKZEROOUT.
+static bool secure_wipe_partition(const std::string& partition) {
+  android::base::unique_fd fd(TEMP_FAILURE_RETRY(open(partition.c_str(), O_WRONLY)));
+  if (fd == -1) {
+    PLOG(ERROR) << "Failed to open \"" << partition << "\"";
+    return false;
+  }
+
+  uint64_t range[2] = { 0, 0 };
+  if (ioctl(fd, BLKGETSIZE64, &range[1]) == -1 || range[1] == 0) {
+    PLOG(ERROR) << "Failed to get partition size";
+    return false;
+  }
+  LOG(INFO) << "Secure-wiping \"" << partition << "\" from " << range[0] << " to " << range[1];
+
+  LOG(INFO) << "  Trying BLKSECDISCARD...";
+  if (ioctl(fd, BLKSECDISCARD, &range) == -1) {
+    PLOG(WARNING) << "  Failed";
+
+    // Use BLKDISCARD if it zeroes out blocks, otherwise use BLKZEROOUT.
+    unsigned int zeroes;
+    if (ioctl(fd, BLKDISCARDZEROES, &zeroes) == 0 && zeroes != 0) {
+      LOG(INFO) << "  Trying BLKDISCARD...";
+      if (ioctl(fd, BLKDISCARD, &range) == -1) {
+        PLOG(ERROR) << "  Failed";
+        return false;
+      }
+    } else {
+      LOG(INFO) << "  Trying BLKZEROOUT...";
+      if (ioctl(fd, BLKZEROOUT, &range) == -1) {
+        PLOG(ERROR) << "  Failed";
+        return false;
+      }
+    }
+  }
+
+  LOG(INFO) << "  Done";
+  return true;
+}
+
+static std::unique_ptr<Package> ReadWipePackage(size_t wipe_package_size) {
+  if (wipe_package_size == 0) {
+    LOG(ERROR) << "wipe_package_size is zero";
+    return nullptr;
+  }
+
+  std::string wipe_package;
+  std::string err_str;
+  if (!read_wipe_package(&wipe_package, wipe_package_size, &err_str)) {
+    PLOG(ERROR) << "Failed to read wipe package" << err_str;
+    return nullptr;
+  }
+
+  return Package::CreateMemoryPackage(
+      std::vector<uint8_t>(wipe_package.begin(), wipe_package.end()), nullptr);
+}
+
+// Checks if the wipe package matches expectation. If the check passes, reads the list of
+// partitions to wipe from the package. Checks include
+// 1. verify the package.
+// 2. check metadata (ota-type, pre-device and serial number if having one).
+static bool CheckWipePackage(Package* wipe_package) {
+  if (!verify_package(wipe_package, ui)) {
+    LOG(ERROR) << "Failed to verify package";
+    return false;
+  }
+
+  ZipArchiveHandle zip = wipe_package->GetZipArchiveHandle();
+  if (!zip) {
+    LOG(ERROR) << "Failed to get ZipArchiveHandle";
+    return false;
+  }
+
+  std::map<std::string, std::string> metadata;
+  if (!ReadMetadataFromPackage(zip, &metadata)) {
+    LOG(ERROR) << "Failed to parse metadata in the zip file";
+    return false;
+  }
+
+  return CheckPackageMetadata(metadata, OtaType::BRICK) == 0;
+}
+
+std::vector<std::string> GetWipePartitionList(Package* wipe_package) {
+  ZipArchiveHandle zip = wipe_package->GetZipArchiveHandle();
+  if (!zip) {
+    LOG(ERROR) << "Failed to get ZipArchiveHandle";
+    return {};
+  }
+
+  static constexpr const char* RECOVERY_WIPE_ENTRY_NAME = "recovery.wipe";
+
+  std::string partition_list_content;
+  ZipString path(RECOVERY_WIPE_ENTRY_NAME);
+  ZipEntry entry;
+  if (FindEntry(zip, path, &entry) == 0) {
+    uint32_t length = entry.uncompressed_length;
+    partition_list_content = std::string(length, '\0');
+    if (auto err = ExtractToMemory(
+            zip, &entry, reinterpret_cast<uint8_t*>(partition_list_content.data()), length);
+        err != 0) {
+      LOG(ERROR) << "Failed to extract " << RECOVERY_WIPE_ENTRY_NAME << ": "
+                 << ErrorCodeString(err);
+      return {};
+    }
+  } else {
+    LOG(INFO) << "Failed to find " << RECOVERY_WIPE_ENTRY_NAME
+              << ", falling back to use the partition list on device.";
+
+    static constexpr const char* RECOVERY_WIPE_ON_DEVICE = "/etc/recovery.wipe";
+    if (!android::base::ReadFileToString(RECOVERY_WIPE_ON_DEVICE, &partition_list_content)) {
+      PLOG(ERROR) << "failed to read \"" << RECOVERY_WIPE_ON_DEVICE << "\"";
+      return {};
+    }
+  }
+
+  std::vector<std::string> result;
+  std::vector<std::string> lines = android::base::Split(partition_list_content, "\n");
+  for (const std::string& line : lines) {
+    std::string partition = android::base::Trim(line);
+    // Ignore '#' comment or empty lines.
+    if (android::base::StartsWith(partition, "#") || partition.empty()) {
+      continue;
+    }
+    result.push_back(line);
+  }
+
+  return result;
+}
+
+// Wipes the current A/B device, with a secure wipe of all the partitions in RECOVERY_WIPE.
+static bool wipe_ab_device(size_t wipe_package_size) {
+  ui->SetBackground(RecoveryUI::ERASING);
+  ui->SetProgressType(RecoveryUI::INDETERMINATE);
+
+  auto wipe_package = ReadWipePackage(wipe_package_size);
+  if (!wipe_package) {
+    LOG(ERROR) << "Failed to open wipe package";
+    return false;
+  }
+
+  if (!CheckWipePackage(wipe_package.get())) {
+    LOG(ERROR) << "Failed to verify wipe package";
+    return false;
+  }
+
+  auto partition_list = GetWipePartitionList(wipe_package.get());
+  if (partition_list.empty()) {
+    LOG(ERROR) << "Empty wipe ab partition list";
+    return false;
+  }
+
+  for (const auto& partition : partition_list) {
+    // Proceed anyway even if it fails to wipe some partition.
+    secure_wipe_partition(partition);
+  }
+  return true;
+}
+
 static void choose_recovery_file(Device* device) {
   std::vector<std::string> entries;
-  if (HasCache()) {
+  if (has_cache) {
     for (int i = 0; i < KEEP_LOG_COUNT; i++) {
       auto add_to_entries = [&](const char* filename) {
         std::string log_file(filename);
@@ -253,7 +417,7 @@ static void choose_recovery_file(Device* device) {
 
   size_t chosen_item = 0;
   while (true) {
-    chosen_item = device->GetUI()->ShowMenu(
+    chosen_item = ui->ShowMenu(
         headers, entries, chosen_item, true,
         std::bind(&Device::HandleMenuKey, device, std::placeholders::_1, std::placeholders::_2));
 
@@ -263,11 +427,11 @@ static void choose_recovery_file(Device* device) {
     }
     if (entries[chosen_item] == "Back") break;
 
-    device->GetUI()->ShowFile(entries[chosen_item]);
+    ui->ShowFile(entries[chosen_item]);
   }
 }
 
-static void run_graphics_test(RecoveryUI* ui) {
+static void run_graphics_test() {
   // Switch to graphics screen.
   ui->ShowText(false);
 
@@ -310,31 +474,20 @@ static void run_graphics_test(RecoveryUI* ui) {
   ui->ShowText(true);
 }
 
-// Shows the recovery UI and waits for user input. Returns one of the device builtin actions, such
-// as REBOOT, SHUTDOWN, or REBOOT_BOOTLOADER. Returning NO_ACTION means to take the default, which
-// is to reboot or shutdown depending on if the --shutdown_after flag was passed to recovery.
-static Device::BuiltinAction PromptAndWait(Device* device, InstallResult status) {
-  auto ui = device->GetUI();
+// Returns REBOOT, SHUTDOWN, or REBOOT_BOOTLOADER. Returning NO_ACTION means to take the default,
+// which is to reboot or shutdown depending on if the --shutdown_after flag was passed to recovery.
+static Device::BuiltinAction prompt_and_wait(Device* device, int status) {
   for (;;) {
-    FinishRecovery(ui);
+    finish_recovery();
     switch (status) {
       case INSTALL_SUCCESS:
       case INSTALL_NONE:
-      case INSTALL_SKIPPED:
-      case INSTALL_RETRY:
-      case INSTALL_KEY_INTERRUPTED:
         ui->SetBackground(RecoveryUI::NO_COMMAND);
         break;
 
       case INSTALL_ERROR:
       case INSTALL_CORRUPT:
         ui->SetBackground(RecoveryUI::ERROR);
-        break;
-
-      case INSTALL_REBOOT:
-        // All the reboots should have been handled prior to entering PromptAndWait() or immediately
-        // after installing a package.
-        LOG(FATAL) << "Invalid status code of INSTALL_REBOOT";
         break;
     }
     ui->SetProgressType(RecoveryUI::EMPTY);
@@ -354,8 +507,6 @@ static Device::BuiltinAction PromptAndWait(Device* device, InstallResult status)
             : device->InvokeMenuItem(chosen_item);
 
     switch (chosen_action) {
-      case Device::REBOOT_FROM_FASTBOOT:    // Can not happen
-      case Device::SHUTDOWN_FROM_FASTBOOT:  // Can not happen
       case Device::NO_ACTION:
         break;
 
@@ -406,7 +557,7 @@ static Device::BuiltinAction PromptAndWait(Device* device, InstallResult status)
           status = ApplyFromAdb(device, false /* rescue_mode */, &reboot_action);
         } else {
           adb = false;
-          status = ApplyFromSdcard(device);
+          status = ApplyFromSdcard(device, ui);
         }
 
         ui->Print("\nInstall from %s completed with status %d.\n", adb ? "ADB" : "SD card", status);
@@ -417,7 +568,7 @@ static Device::BuiltinAction PromptAndWait(Device* device, InstallResult status)
         if (status != INSTALL_SUCCESS) {
           ui->SetBackground(RecoveryUI::ERROR);
           ui->Print("Installation aborted.\n");
-          copy_logs(save_current_log);
+          copy_logs(save_current_log, has_cache, sehandle);
         } else if (!ui->IsTextVisible()) {
           return Device::NO_ACTION;  // reboot if logs aren't visible
         }
@@ -429,7 +580,7 @@ static Device::BuiltinAction PromptAndWait(Device* device, InstallResult status)
         break;
 
       case Device::RUN_GRAPHICS_TEST:
-        run_graphics_test(ui);
+        run_graphics_test();
         break;
 
       case Device::RUN_LOCALE_TEST: {
@@ -438,7 +589,8 @@ static Device::BuiltinAction PromptAndWait(Device* device, InstallResult status)
         break;
       }
       case Device::MOUNT_SYSTEM:
-        if (ensure_path_mounted_at(android::fs_mgr::GetSystemRoot(), "/mnt/system") != -1) {
+        // the system partition is mounted at /mnt/system
+        if (ensure_path_mounted_at(get_system_root(), "/mnt/system") != -1) {
           ui->Print("Mounted /system.\n");
         }
         break;
@@ -453,17 +605,74 @@ static void print_property(const char* key, const char* name, void* /* cookie */
   printf("%s=%s\n", key, name);
 }
 
-static bool IsBatteryOk(int* required_battery_level) {
-  // GmsCore enters recovery mode to install package when having enough battery percentage.
-  // Normally, the threshold is 40% without charger and 20% with charger. So we check the battery
-  // level against a slightly lower limit.
-  constexpr int BATTERY_OK_PERCENTAGE = 20;
-  constexpr int BATTERY_WITH_CHARGER_OK_PERCENTAGE = 15;
+static bool is_battery_ok(int* required_battery_level) {
+  using android::hardware::health::V1_0::BatteryStatus;
+  using android::hardware::health::V2_0::get_health_service;
+  using android::hardware::health::V2_0::IHealth;
+  using android::hardware::health::V2_0::Result;
+  using android::hardware::health::V2_0::toString;
 
-  auto battery_info = GetBatteryInfo();
-  *required_battery_level =
-      battery_info.charging ? BATTERY_WITH_CHARGER_OK_PERCENTAGE : BATTERY_OK_PERCENTAGE;
-  return battery_info.capacity >= *required_battery_level;
+  android::sp<IHealth> health = get_health_service();
+
+  static constexpr int BATTERY_READ_TIMEOUT_IN_SEC = 10;
+  int wait_second = 0;
+  while (true) {
+    auto charge_status = BatteryStatus::UNKNOWN;
+
+    if (health == nullptr) {
+      LOG(WARNING) << "no health implementation is found, assuming defaults";
+    } else {
+      health
+          ->getChargeStatus([&charge_status](auto res, auto out_status) {
+            if (res == Result::SUCCESS) {
+              charge_status = out_status;
+            }
+          })
+          .isOk();  // should not have transport error
+    }
+
+    // Treat unknown status as charged.
+    bool charged = (charge_status != BatteryStatus::DISCHARGING &&
+                    charge_status != BatteryStatus::NOT_CHARGING);
+
+    Result res = Result::UNKNOWN;
+    int32_t capacity = INT32_MIN;
+    if (health != nullptr) {
+      health
+          ->getCapacity([&res, &capacity](auto out_res, auto out_capacity) {
+            res = out_res;
+            capacity = out_capacity;
+          })
+          .isOk();  // should not have transport error
+    }
+
+    LOG(INFO) << "charge_status " << toString(charge_status) << ", charged " << charged
+              << ", status " << toString(res) << ", capacity " << capacity;
+    // At startup, the battery drivers in devices like N5X/N6P take some time to load
+    // the battery profile. Before the load finishes, it reports value 50 as a fake
+    // capacity. BATTERY_READ_TIMEOUT_IN_SEC is set that the battery drivers are expected
+    // to finish loading the battery profile earlier than 10 seconds after kernel startup.
+    if (res == Result::SUCCESS && capacity == 50) {
+      if (wait_second < BATTERY_READ_TIMEOUT_IN_SEC) {
+        sleep(1);
+        wait_second++;
+        continue;
+      }
+    }
+    // If we can't read battery percentage, it may be a device without battery. In this
+    // situation, use 100 as a fake battery percentage.
+    if (res != Result::SUCCESS) {
+      capacity = 100;
+    }
+
+    // GmsCore enters recovery mode to install package when having enough battery percentage.
+    // Normally, the threshold is 40% without charger and 20% with charger. So we should check
+    // battery with a slightly lower limitation.
+    static constexpr int BATTERY_OK_PERCENTAGE = 20;
+    static constexpr int BATTERY_WITH_CHARGER_OK_PERCENTAGE = 15;
+    *required_battery_level = charged ? BATTERY_WITH_CHARGER_OK_PERCENTAGE : BATTERY_OK_PERCENTAGE;
+    return capacity >= *required_battery_level;
+  }
 }
 
 // Set the retry count to |retry_count| in BCB.
@@ -518,7 +727,6 @@ Device::BuiltinAction start_recovery(Device* device, const std::vector<std::stri
   static constexpr struct option OPTIONS[] = {
     { "fastboot", no_argument, nullptr, 0 },
     { "fsck_unshare_blocks", no_argument, nullptr, 0 },
-    { "install_with_fuse", no_argument, nullptr, 0 },
     { "just_exit", no_argument, nullptr, 'x' },
     { "locale", required_argument, nullptr, 0 },
     { "prompt_and_wipe_data", no_argument, nullptr, 0 },
@@ -539,7 +747,6 @@ Device::BuiltinAction start_recovery(Device* device, const std::vector<std::stri
   };
 
   const char* update_package = nullptr;
-  bool install_with_fuse = false;  // memory map the update package by default.
   bool should_wipe_data = false;
   bool should_prompt_and_wipe_data = false;
   bool should_wipe_cache = false;
@@ -575,12 +782,12 @@ Device::BuiltinAction start_recovery(Device* device, const std::vector<std::stri
         std::string option = OPTIONS[option_index].name;
         if (option == "fsck_unshare_blocks") {
           fsck_unshare_blocks = true;
-        } else if (option == "install_with_fuse") {
-          install_with_fuse = true;
-        } else if (option == "locale" || option == "fastboot" || option == "reason") {
+        } else if (option == "locale" || option == "fastboot") {
           // Handled in recovery_main.cpp
         } else if (option == "prompt_and_wipe_data") {
           should_prompt_and_wipe_data = true;
+        } else if (option == "reason") {
+          reason = optarg;
         } else if (option == "rescue") {
           rescue = true;
         } else if (option == "retry_count") {
@@ -614,18 +821,15 @@ Device::BuiltinAction start_recovery(Device* device, const std::vector<std::stri
   }
   optind = 1;
 
-  printf("stage is [%s]\n", device->GetStage().value_or("").c_str());
-  printf("reason is [%s]\n", device->GetReason().value_or("").c_str());
-
-  auto ui = device->GetUI();
+  printf("stage is [%s]\n", stage.c_str());
+  printf("reason is [%s]\n", reason);
 
   // Set background string to "installing security update" for security update,
   // otherwise set it to "installing system update".
   ui->SetSystemUpdateText(security_update);
 
   int st_cur, st_max;
-  if (!device->GetStage().has_value() &&
-      sscanf(device->GetStage().value().c_str(), "%d/%d", &st_cur, &st_max) == 2) {
+  if (!stage.empty() && sscanf(stage.c_str(), "%d/%d", &st_cur, &st_max) == 2) {
     ui->SetStage(st_cur, st_max);
   }
 
@@ -646,7 +850,9 @@ Device::BuiltinAction start_recovery(Device* device, const std::vector<std::stri
   property_list(print_property, nullptr);
   printf("\n");
 
-  InstallResult status = INSTALL_SUCCESS;
+  ui->Print("Supported API: %d\n", kRecoveryApiVersion);
+
+  int status = INSTALL_SUCCESS;
   // next_action indicates the next target to reboot into upon finishing the install. It could be
   // overridden to a different reboot target per user request.
   Device::BuiltinAction next_action = shutdown_after ? Device::SHUTDOWN : Device::REBOOT;
@@ -656,10 +862,12 @@ Device::BuiltinAction start_recovery(Device* device, const std::vector<std::stri
     // to log the update attempt since update_package is non-NULL.
     save_current_log = true;
 
-    if (int required_battery_level; retry_count == 0 && !IsBatteryOk(&required_battery_level)) {
+    int required_battery_level;
+    if (retry_count == 0 && !is_battery_ok(&required_battery_level)) {
       ui->Print("battery capacity is not enough for installing package: %d%% needed\n",
                 required_battery_level);
-      // Log the error code to last_install when installation skips due to low battery.
+      // Log the error code to last_install when installation skips due to
+      // low battery.
       log_failure_code(kLowBattery, update_package);
       status = INSTALL_SKIPPED;
     } else if (retry_count == 0 && bootreason_in_blacklist()) {
@@ -674,29 +882,29 @@ Device::BuiltinAction start_recovery(Device* device, const std::vector<std::stri
         set_retry_bootloader_message(retry_count + 1, args);
       }
 
-      if (update_package[0] == '@') {
-        ensure_path_mounted(update_package + 1);
-      } else {
-        ensure_path_mounted(update_package);
-      }
-
-      if (install_with_fuse) {
+      bool should_use_fuse = false;
+      if (!SetupPackageMount(update_package, &should_use_fuse)) {
+        LOG(INFO) << "Failed to set up the package access, skipping installation";
+        status = INSTALL_ERROR;
+      } else if (should_use_fuse) {
         LOG(INFO) << "Installing package " << update_package << " with fuse";
-        status = InstallWithFuseFromPath(update_package, ui);
+        auto file_data_reader = std::make_unique<FuseFileDataProvider>(update_package, 65536);
+        status = run_fuse_sideload(std::move(file_data_reader));
       } else if (auto memory_package = Package::CreateMemoryPackage(
                      update_package,
                      std::bind(&RecoveryUI::SetProgress, ui, std::placeholders::_1));
                  memory_package != nullptr) {
-        status = InstallPackage(memory_package.get(), update_package, should_wipe_cache,
-                                retry_count, ui);
+        status = install_package(update_package, should_wipe_cache, true, retry_count, ui);
       } else {
         // We may fail to memory map the package on 32 bit builds for packages with 2GiB+ size.
         // In such cases, we will try to install the package with fuse. This is not the default
         // installation method because it introduces a layer of indirection from the kernel space.
         LOG(WARNING) << "Failed to memory map package " << update_package
                      << "; falling back to install with fuse";
-        status = InstallWithFuseFromPath(update_package, ui);
+        auto file_data_reader = std::make_unique<FuseFileDataProvider>(update_package, 65536);
+        status = run_fuse_sideload(std::move(file_data_reader));
       }
+
       if (status != INSTALL_SUCCESS) {
         ui->Print("Installation aborted.\n");
 
@@ -704,14 +912,14 @@ Device::BuiltinAction start_recovery(Device* device, const std::vector<std::stri
         // RETRY_LIMIT times before we abandon this OTA update.
         static constexpr int RETRY_LIMIT = 4;
         if (status == INSTALL_RETRY && retry_count < RETRY_LIMIT) {
-          copy_logs(save_current_log);
+          copy_logs(save_current_log, has_cache, sehandle);
           retry_count += 1;
           set_retry_bootloader_message(retry_count, args);
           // Print retry count on screen.
           ui->Print("Retry attempt %d\n", retry_count);
 
-          // Reboot back into recovery to retry the update.
-          if (!Reboot("recovery")) {
+          // Reboot and retry the update
+          if (!reboot("reboot,recovery")) {
             ui->Print("Reboot failed\n");
           } else {
             while (true) {
@@ -722,15 +930,14 @@ Device::BuiltinAction start_recovery(Device* device, const std::vector<std::stri
         // If this is an eng or userdebug build, then automatically
         // turn the text display on if the script fails so the error
         // message is visible.
-        if (IsRoDebuggable()) {
+        if (is_ro_debuggable()) {
           ui->ShowText(true);
         }
       }
     }
   } else if (should_wipe_data) {
     save_current_log = true;
-    CHECK(device->GetReason().has_value());
-    bool convert_fbe = device->GetReason().value() == "convert_fbe";
+    bool convert_fbe = reason && strcmp(reason, "convert_fbe") == 0;
     if (!WipeData(device, convert_fbe)) {
       status = INSTALL_ERROR;
     }
@@ -750,7 +957,7 @@ Device::BuiltinAction start_recovery(Device* device, const std::vector<std::stri
       status = INSTALL_ERROR;
     }
   } else if (should_wipe_ab) {
-    if (!WipeAbDevice(device, wipe_package_size)) {
+    if (!wipe_ab_device(wipe_package_size)) {
       status = INSTALL_ERROR;
     }
   } else if (sideload) {
@@ -780,7 +987,7 @@ Device::BuiltinAction start_recovery(Device* device, const std::vector<std::stri
     // If this is an eng or userdebug build, automatically turn on the text display if no command
     // is specified. Note that this should be called before setting the background to avoid
     // flickering the background image.
-    if (IsRoDebuggable()) {
+    if (is_ro_debuggable()) {
       ui->ShowText(true);
     }
     status = INSTALL_NONE;  // No command specified
@@ -805,7 +1012,7 @@ Device::BuiltinAction start_recovery(Device* device, const std::vector<std::stri
   //    for 5s followed by an automatic reboot.
   if (status != INSTALL_REBOOT) {
     if (status == INSTALL_NONE || ui->IsTextVisible()) {
-      auto temp = PromptAndWait(device, status);
+      Device::BuiltinAction temp = prompt_and_wait(device, status);
       if (temp != Device::NO_ACTION) {
         next_action = temp;
       }
@@ -813,7 +1020,7 @@ Device::BuiltinAction start_recovery(Device* device, const std::vector<std::stri
   }
 
   // Save logs and clean up before rebooting or shutting down.
-  FinishRecovery(ui);
+  finish_recovery();
 
   return next_action;
 }

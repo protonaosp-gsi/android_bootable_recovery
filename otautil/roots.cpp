@@ -14,12 +14,15 @@
  * limitations under the License.
  */
 
-#include "recovery_utils/roots.h"
+#include "otautil/roots.h"
 
+#include <ctype.h>
 #include <fcntl.h>
+#include <inttypes.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -30,13 +33,16 @@
 #include <vector>
 
 #include <android-base/logging.h>
+#include <android-base/properties.h>
 #include <android-base/stringprintf.h>
 #include <android-base/unique_fd.h>
 #include <cryptfs.h>
 #include <ext4_utils/wipe.h>
 #include <fs_mgr.h>
 #include <fs_mgr/roots.h>
+#include <fs_mgr_dm_linear.h>
 
+#include "otautil/mounts.h"
 #include "otautil/sysutil.h"
 
 using android::fs_mgr::Fstab;
@@ -45,8 +51,6 @@ using android::fs_mgr::ReadDefaultFstab;
 
 static Fstab fstab;
 
-constexpr const char* CACHE_ROOT = "/cache";
-
 void load_volume_table() {
   if (!ReadDefaultFstab(&fstab)) {
     LOG(ERROR) << "Failed to read default fstab";
@@ -54,11 +58,7 @@ void load_volume_table() {
   }
 
   fstab.emplace_back(FstabEntry{
-      .blk_device = "ramdisk",
-      .mount_point = "/tmp",
-      .fs_type = "ramdisk",
-      .length = 0,
-  });
+      .mount_point = "/tmp", .fs_type = "ramdisk", .blk_device = "ramdisk", .length = 0 });
 
   std::cout << "recovery filesystem table" << std::endl << "=========================" << std::endl;
   for (size_t i = 0; i < fstab.size(); ++i) {
@@ -276,8 +276,10 @@ int setup_install_mounts() {
   return 0;
 }
 
-bool HasCache() {
-  CHECK(!fstab.empty());
-  static bool has_cache = volume_for_mount_point(CACHE_ROOT) != nullptr;
-  return has_cache;
+bool logical_partitions_mapped() {
+  return android::fs_mgr::LogicalPartitionsMapped();
+}
+
+std::string get_system_root() {
+  return android::fs_mgr::GetSystemRoot();
 }

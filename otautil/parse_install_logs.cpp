@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "recovery_utils/parse_install_logs.h"
+#include "otautil/parse_install_logs.h"
 
 #include <unistd.h>
 

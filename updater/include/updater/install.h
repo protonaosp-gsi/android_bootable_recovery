@@ -14,6 +14,15 @@
  * limitations under the License.
  */
 
-#pragma once
+#ifndef _UPDATER_INSTALL_H_
+#define _UPDATER_INSTALL_H_
+
+struct State;
 
 void RegisterInstallFunctions();
+
+// uiPrintf function prints msg to screen as well as logs
+void uiPrintf(State* _Nonnull state, const char* _Nonnull format, ...)
+    __attribute__((__format__(printf, 2, 3)));
+
+#endif

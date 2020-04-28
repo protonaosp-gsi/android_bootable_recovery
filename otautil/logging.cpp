@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "recovery_utils/logging.h"
+#include "otautil/logging.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -38,7 +38,7 @@
 
 #include "otautil/dirutil.h"
 #include "otautil/paths.h"
-#include "recovery_utils/roots.h"
+#include "otautil/roots.h"
 
 constexpr const char* LOG_FILE = "/cache/recovery/log";
 constexpr const char* LAST_INSTALL_FILE = "/cache/recovery/last_install";
@@ -178,8 +178,9 @@ void reset_tmplog_offset() {
   tmplog_offset = 0;
 }
 
-static void copy_log_file(const std::string& source, const std::string& destination, bool append) {
-  FILE* dest_fp = fopen_path(destination, append ? "ae" : "we", logging_sehandle);
+static void copy_log_file(const std::string& source, const std::string& destination, bool append,
+                          const selabel_handle* sehandle) {
+  FILE* dest_fp = fopen_path(destination, append ? "ae" : "we", sehandle);
   if (dest_fp == nullptr) {
     PLOG(ERROR) << "Can't open " << destination;
   } else {
@@ -202,7 +203,7 @@ static void copy_log_file(const std::string& source, const std::string& destinat
   }
 }
 
-void copy_logs(bool save_current_log) {
+void copy_logs(bool save_current_log, bool has_cache, const selabel_handle* sehandle) {
   // We only rotate and record the log of the current session if explicitly requested. This usually
   // happens after wipes, installation from BCB or menu selections. This is to avoid unnecessary
   // rotation (and possible deletion) of log files, if it does not do anything loggable.
@@ -215,7 +216,7 @@ void copy_logs(bool save_current_log) {
   copy_log_file_to_pmsg(Paths::Get().temporary_install_file(), LAST_INSTALL_FILE);
 
   // We can do nothing for now if there's no /cache partition.
-  if (!HasCache()) {
+  if (!has_cache) {
     return;
   }
 
@@ -224,9 +225,9 @@ void copy_logs(bool save_current_log) {
   rotate_logs(LAST_LOG_FILE, LAST_KMSG_FILE);
 
   // Copy logs to cache so the system can find out what happened.
-  copy_log_file(Paths::Get().temporary_log_file(), LOG_FILE, true);
-  copy_log_file(Paths::Get().temporary_log_file(), LAST_LOG_FILE, false);
-  copy_log_file(Paths::Get().temporary_install_file(), LAST_INSTALL_FILE, false);
+  copy_log_file(Paths::Get().temporary_log_file(), LOG_FILE, true, sehandle);
+  copy_log_file(Paths::Get().temporary_log_file(), LAST_LOG_FILE, false, sehandle);
+  copy_log_file(Paths::Get().temporary_install_file(), LAST_INSTALL_FILE, false, sehandle);
   save_kernel_log(LAST_KMSG_FILE);
   chmod(LOG_FILE, 0600);
   chown(LOG_FILE, AID_SYSTEM, AID_SYSTEM);
@@ -318,7 +319,7 @@ bool RestoreLogFilesAfterFormat(const std::vector<saved_log_file>& log_files) {
   // Reset the pointer so we copy from the beginning of the temp
   // log.
   reset_tmplog_offset();
-  copy_logs(true /* save_current_log */);
+  copy_logs(true /* save_current_log */, true /* has_cache */, logging_sehandle);
 
   return true;
 }

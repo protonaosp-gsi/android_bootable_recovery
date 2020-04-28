@@ -73,11 +73,10 @@ std::ostream& operator<<(std::ostream& os, const Partition& partition);
 // the 'target' Partition. While patching, it will backup the data on the source partition to
 // /cache, so that the patching could be resumed on interruption even if both of the source and
 // target partitions refer to the same device. The function is idempotent if called multiple times.
-// 'bonus' can be provided if the patch was generated with a bonus output, or nullptr.
-// 'backup_source' indicates whether the source partition should be backed up prior to the update
-// (e.g. when doing in-place update). Returns the patching result.
+// An optional arg 'bonus' can be provided, if the patch was generated with a bonus output.
+// Returns the patching result.
 bool PatchPartition(const Partition& target, const Partition& source, const Value& patch,
-                    const Value* bonus, bool backup_source);
+                    const Value* bonus);
 
 // Returns whether the contents of the eMMC target or the cached file match the embedded hash.
 // It will look for the backup on /cache if the given partition doesn't match the checksum.

@@ -33,8 +33,8 @@
 #include <ziparchive/zip_writer.h>
 
 #include "install/install.h"
-#include "install/wipe_device.h"
 #include "otautil/paths.h"
+#include "otautil/roots.h"
 #include "private/setup_commands.h"
 
 static void BuildZipArchive(const std::map<std::string, std::string>& file_map, int fd,
@@ -205,7 +205,7 @@ TEST(InstallTest, SetUpNonAbUpdateCommands) {
   std::string binary_path = std::string(td.path) + "/update_binary";
   Paths::Get().set_temporary_update_binary(binary_path);
   std::vector<std::string> cmd;
-  ASSERT_TRUE(SetUpNonAbUpdateCommands(package, zip, 0, status_fd, &cmd));
+  ASSERT_EQ(0, SetUpNonAbUpdateCommands(package, zip, 0, status_fd, &cmd));
   ASSERT_EQ(4U, cmd.size());
   ASSERT_EQ(binary_path, cmd[0]);
   ASSERT_EQ("3", cmd[1]);  // RECOVERY_API_VERSION
@@ -217,7 +217,7 @@ TEST(InstallTest, SetUpNonAbUpdateCommands) {
 
   // With non-zero retry count. update_binary will be removed automatically.
   cmd.clear();
-  ASSERT_TRUE(SetUpNonAbUpdateCommands(package, zip, 2, status_fd, &cmd));
+  ASSERT_EQ(0, SetUpNonAbUpdateCommands(package, zip, 2, status_fd, &cmd));
   ASSERT_EQ(5U, cmd.size());
   ASSERT_EQ(binary_path, cmd[0]);
   ASSERT_EQ("3", cmd[1]);  // RECOVERY_API_VERSION
@@ -244,7 +244,7 @@ TEST(InstallTest, SetUpNonAbUpdateCommands_MissingUpdateBinary) {
   TemporaryDir td;
   Paths::Get().set_temporary_update_binary(std::string(td.path) + "/update_binary");
   std::vector<std::string> cmd;
-  ASSERT_FALSE(SetUpNonAbUpdateCommands(package, zip, 0, status_fd, &cmd));
+  ASSERT_EQ(INSTALL_CORRUPT, SetUpNonAbUpdateCommands(package, zip, 0, status_fd, &cmd));
   CloseArchive(zip);
 }
 
@@ -271,18 +271,19 @@ static void VerifyAbUpdateCommands(const std::string& serialno, bool success = t
 
   ZipArchiveHandle zip;
   ASSERT_EQ(0, OpenArchive(temp_file.path, &zip));
+  ZipString payload_name("payload.bin");
   ZipEntry payload_entry;
-  ASSERT_EQ(0, FindEntry(zip, "payload.bin", &payload_entry));
+  ASSERT_EQ(0, FindEntry(zip, payload_name, &payload_entry));
 
   std::map<std::string, std::string> metadata;
   ASSERT_TRUE(ReadMetadataFromPackage(zip, &metadata));
   if (success) {
-    ASSERT_TRUE(CheckPackageMetadata(metadata, OtaType::AB));
+    ASSERT_EQ(0, CheckPackageMetadata(metadata, OtaType::AB));
 
     int status_fd = 10;
     std::string package = "/path/to/update.zip";
     std::vector<std::string> cmd;
-    ASSERT_TRUE(SetUpAbUpdateCommands(package, zip, status_fd, &cmd));
+    ASSERT_EQ(0, SetUpAbUpdateCommands(package, zip, status_fd, &cmd));
     ASSERT_EQ(5U, cmd.size());
     ASSERT_EQ("/system/bin/update_engine_sideload", cmd[0]);
     ASSERT_EQ("--payload=file://" + package, cmd[1]);
@@ -290,7 +291,7 @@ static void VerifyAbUpdateCommands(const std::string& serialno, bool success = t
     ASSERT_EQ("--headers=" + properties, cmd[3]);
     ASSERT_EQ("--status_fd=" + std::to_string(status_fd), cmd[4]);
   } else {
-    ASSERT_FALSE(CheckPackageMetadata(metadata, OtaType::AB));
+    ASSERT_EQ(INSTALL_ERROR, CheckPackageMetadata(metadata, OtaType::AB));
   }
   CloseArchive(zip);
 }
@@ -325,7 +326,7 @@ TEST(InstallTest, SetUpAbUpdateCommands_MissingPayloadPropertiesTxt) {
   int status_fd = 10;
   std::string package = "/path/to/update.zip";
   std::vector<std::string> cmd;
-  ASSERT_FALSE(SetUpAbUpdateCommands(package, zip, status_fd, &cmd));
+  ASSERT_EQ(INSTALL_CORRUPT, SetUpAbUpdateCommands(package, zip, status_fd, &cmd));
   CloseArchive(zip);
 }
 
@@ -358,8 +359,8 @@ TEST(InstallTest, SetUpAbUpdateCommands_MultipleSerialnos) {
   VerifyAbUpdateCommands(long_serialno);
 }
 
-static void TestCheckPackageMetadata(const std::string& metadata_string, OtaType ota_type,
-                                     bool exptected_result) {
+static void test_check_package_metadata(const std::string& metadata_string, OtaType ota_type,
+                                        int exptected_result) {
   TemporaryFile temp_file;
   BuildZipArchive(
       {
@@ -387,7 +388,7 @@ TEST(InstallTest, CheckPackageMetadata_ota_type) {
           "post-timestamp=" + std::to_string(std::numeric_limits<int64_t>::max()),
       },
       "\n");
-  TestCheckPackageMetadata(metadata, OtaType::AB, false);
+  test_check_package_metadata(metadata, OtaType::AB, INSTALL_ERROR);
 
   // Checks if ota-type matches
   metadata = android::base::Join(
@@ -397,9 +398,9 @@ TEST(InstallTest, CheckPackageMetadata_ota_type) {
           "post-timestamp=" + std::to_string(std::numeric_limits<int64_t>::max()),
       },
       "\n");
-  TestCheckPackageMetadata(metadata, OtaType::AB, true);
+  test_check_package_metadata(metadata, OtaType::AB, 0);
 
-  TestCheckPackageMetadata(metadata, OtaType::BRICK, false);
+  test_check_package_metadata(metadata, OtaType::BRICK, INSTALL_ERROR);
 }
 
 TEST(InstallTest, CheckPackageMetadata_device_type) {
@@ -409,7 +410,7 @@ TEST(InstallTest, CheckPackageMetadata_device_type) {
           "ota-type=BRICK",
       },
       "\n");
-  TestCheckPackageMetadata(metadata, OtaType::BRICK, false);
+  test_check_package_metadata(metadata, OtaType::BRICK, INSTALL_ERROR);
 
   // device type mismatches
   metadata = android::base::Join(
@@ -418,7 +419,7 @@ TEST(InstallTest, CheckPackageMetadata_device_type) {
           "pre-device=dummy_device_type",
       },
       "\n");
-  TestCheckPackageMetadata(metadata, OtaType::BRICK, false);
+  test_check_package_metadata(metadata, OtaType::BRICK, INSTALL_ERROR);
 }
 
 TEST(InstallTest, CheckPackageMetadata_serial_number_smoke) {
@@ -432,7 +433,7 @@ TEST(InstallTest, CheckPackageMetadata_serial_number_smoke) {
           "pre-device=" + device,
       },
       "\n");
-  TestCheckPackageMetadata(metadata, OtaType::BRICK, true);
+  test_check_package_metadata(metadata, OtaType::BRICK, 0);
 
   // Serial number mismatches
   metadata = android::base::Join(
@@ -442,7 +443,7 @@ TEST(InstallTest, CheckPackageMetadata_serial_number_smoke) {
           "serialno=dummy_serial",
       },
       "\n");
-  TestCheckPackageMetadata(metadata, OtaType::BRICK, false);
+  test_check_package_metadata(metadata, OtaType::BRICK, INSTALL_ERROR);
 
   std::string serialno = android::base::GetProperty("ro.serialno", "");
   ASSERT_NE("", serialno);
@@ -453,7 +454,7 @@ TEST(InstallTest, CheckPackageMetadata_serial_number_smoke) {
           "serialno=" + serialno,
       },
       "\n");
-  TestCheckPackageMetadata(metadata, OtaType::BRICK, true);
+  test_check_package_metadata(metadata, OtaType::BRICK, 0);
 }
 
 TEST(InstallTest, CheckPackageMetadata_multiple_serial_number) {
@@ -477,7 +478,7 @@ TEST(InstallTest, CheckPackageMetadata_multiple_serial_number) {
           "serialno=" + android::base::Join(serial_numbers, '|'),
       },
       "\n");
-  TestCheckPackageMetadata(metadata, OtaType::BRICK, false);
+  test_check_package_metadata(metadata, OtaType::BRICK, INSTALL_ERROR);
 
   serial_numbers.emplace_back(serialno);
   std::shuffle(serial_numbers.begin(), serial_numbers.end(), std::default_random_engine());
@@ -488,7 +489,7 @@ TEST(InstallTest, CheckPackageMetadata_multiple_serial_number) {
           "serialno=" + android::base::Join(serial_numbers, '|'),
       },
       "\n");
-  TestCheckPackageMetadata(metadata, OtaType::BRICK, true);
+  test_check_package_metadata(metadata, OtaType::BRICK, 0);
 }
 
 TEST(InstallTest, CheckPackageMetadata_ab_build_version) {
@@ -506,7 +507,7 @@ TEST(InstallTest, CheckPackageMetadata_ab_build_version) {
           "post-timestamp=" + std::to_string(std::numeric_limits<int64_t>::max()),
       },
       "\n");
-  TestCheckPackageMetadata(metadata, OtaType::AB, true);
+  test_check_package_metadata(metadata, OtaType::AB, 0);
 
   metadata = android::base::Join(
       std::vector<std::string>{
@@ -516,7 +517,7 @@ TEST(InstallTest, CheckPackageMetadata_ab_build_version) {
           "post-timestamp=" + std::to_string(std::numeric_limits<int64_t>::max()),
       },
       "\n");
-  TestCheckPackageMetadata(metadata, OtaType::AB, false);
+  test_check_package_metadata(metadata, OtaType::AB, INSTALL_ERROR);
 }
 
 TEST(InstallTest, CheckPackageMetadata_ab_fingerprint) {
@@ -534,7 +535,7 @@ TEST(InstallTest, CheckPackageMetadata_ab_fingerprint) {
           "post-timestamp=" + std::to_string(std::numeric_limits<int64_t>::max()),
       },
       "\n");
-  TestCheckPackageMetadata(metadata, OtaType::AB, true);
+  test_check_package_metadata(metadata, OtaType::AB, 0);
 
   metadata = android::base::Join(
       std::vector<std::string>{
@@ -544,7 +545,7 @@ TEST(InstallTest, CheckPackageMetadata_ab_fingerprint) {
           "post-timestamp=" + std::to_string(std::numeric_limits<int64_t>::max()),
       },
       "\n");
-  TestCheckPackageMetadata(metadata, OtaType::AB, false);
+  test_check_package_metadata(metadata, OtaType::AB, INSTALL_ERROR);
 }
 
 TEST(InstallTest, CheckPackageMetadata_ab_post_timestamp) {
@@ -558,7 +559,7 @@ TEST(InstallTest, CheckPackageMetadata_ab_post_timestamp) {
           "pre-device=" + device,
       },
       "\n");
-  TestCheckPackageMetadata(metadata, OtaType::AB, false);
+  test_check_package_metadata(metadata, OtaType::AB, INSTALL_ERROR);
 
   // post timestamp should be larger than the timestamp on device.
   metadata = android::base::Join(
@@ -568,7 +569,7 @@ TEST(InstallTest, CheckPackageMetadata_ab_post_timestamp) {
           "post-timestamp=0",
       },
       "\n");
-  TestCheckPackageMetadata(metadata, OtaType::AB, false);
+  test_check_package_metadata(metadata, OtaType::AB, INSTALL_ERROR);
 
   // fingerprint is required for downgrade
   metadata = android::base::Join(
@@ -579,7 +580,7 @@ TEST(InstallTest, CheckPackageMetadata_ab_post_timestamp) {
           "ota-downgrade=yes",
       },
       "\n");
-  TestCheckPackageMetadata(metadata, OtaType::AB, false);
+  test_check_package_metadata(metadata, OtaType::AB, INSTALL_ERROR);
 
   std::string finger_print = android::base::GetProperty("ro.build.fingerprint", "");
   ASSERT_NE("", finger_print);
@@ -593,5 +594,32 @@ TEST(InstallTest, CheckPackageMetadata_ab_post_timestamp) {
           "ota-downgrade=yes",
       },
       "\n");
-  TestCheckPackageMetadata(metadata, OtaType::AB, true);
+  test_check_package_metadata(metadata, OtaType::AB, 0);
+}
+
+TEST(InstallTest, SetupPackageMount_package_path) {
+  load_volume_table();
+  bool install_with_fuse;
+
+  // Setup should fail if the input path doesn't exist.
+  ASSERT_FALSE(SetupPackageMount("/does_not_exist", &install_with_fuse));
+
+  // Package should be installed with fuse if it's not in /cache.
+  TemporaryDir temp_dir;
+  TemporaryFile update_package(temp_dir.path);
+  ASSERT_TRUE(SetupPackageMount(update_package.path, &install_with_fuse));
+  ASSERT_TRUE(install_with_fuse);
+
+  // Setup should fail if the input path isn't canonicalized.
+  std::string uncanonical_package_path = android::base::Join(
+      std::vector<std::string>{
+          temp_dir.path,
+          "..",
+          android::base::Basename(temp_dir.path),
+          android::base::Basename(update_package.path),
+      },
+      '/');
+
+  ASSERT_EQ(0, access(uncanonical_package_path.c_str(), R_OK));
+  ASSERT_FALSE(SetupPackageMount(uncanonical_package_path, &install_with_fuse));
 }

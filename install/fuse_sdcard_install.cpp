@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "install/fuse_install.h"
+#include "install/fuse_sdcard_install.h"
 
 #include <dirent.h>
 #include <signal.h>
@@ -27,7 +27,6 @@
 #include <algorithm>
 #include <functional>
 #include <memory>
-#include <string>
 #include <vector>
 
 #include <android-base/logging.h>
@@ -37,7 +36,7 @@
 #include "fuse_provider.h"
 #include "fuse_sideload.h"
 #include "install/install.h"
-#include "recovery_utils/roots.h"
+#include "otautil/roots.h"
 
 static constexpr const char* SDCARD_ROOT = "/sdcard";
 // How long (in seconds) we wait for the fuse-provided package file to
@@ -75,8 +74,7 @@ static std::string BrowseDirectory(const std::string& path, Device* device, Reco
       // Skip "." and ".." entries.
       if (name == "." || name == "..") continue;
       dirs.push_back(name + "/");
-    } else if (de->d_type == DT_REG && (android::base::EndsWithIgnoreCase(name, ".zip") ||
-                                        android::base::EndsWithIgnoreCase(name, ".map"))) {
+    } else if (de->d_type == DT_REG && android::base::EndsWithIgnoreCase(name, ".zip")) {
       entries.push_back(name);
     }
   }
@@ -121,44 +119,49 @@ static std::string BrowseDirectory(const std::string& path, Device* device, Reco
   // Unreachable.
 }
 
-static bool StartInstallPackageFuse(std::string_view path) {
-  if (path.empty()) {
+static bool StartSdcardFuse(const std::string& path) {
+  auto file_data_reader = std::make_unique<FuseFileDataProvider>(path, 65536);
+
+  if (!file_data_reader->Valid()) {
     return false;
   }
 
-  constexpr auto FUSE_BLOCK_SIZE = 65536;
-  bool is_block_map = android::base::ConsumePrefix(&path, "@");
-  auto fuse_data_provider =
-      is_block_map ? FuseBlockDataProvider::CreateFromBlockMap(std::string(path), FUSE_BLOCK_SIZE)
-                   : FuseFileDataProvider::CreateFromFile(std::string(path), FUSE_BLOCK_SIZE);
+  // The installation process expects to find the sdcard unmounted. Unmount it with MNT_DETACH so
+  // that our open file continues to work but new references see it as unmounted.
+  umount2("/sdcard", MNT_DETACH);
 
-  if (!fuse_data_provider || !fuse_data_provider->Valid()) {
-    LOG(ERROR) << "Failed to create fuse data provider.";
-    return false;
-  }
-
-  if (android::base::StartsWith(path, SDCARD_ROOT)) {
-    // The installation process expects to find the sdcard unmounted. Unmount it with MNT_DETACH so
-    // that our open file continues to work but new references see it as unmounted.
-    umount2(SDCARD_ROOT, MNT_DETACH);
-  }
-
-  return run_fuse_sideload(std::move(fuse_data_provider)) == 0;
+  return run_fuse_sideload(std::move(file_data_reader)) == 0;
 }
 
-InstallResult InstallWithFuseFromPath(std::string_view path, RecoveryUI* ui) {
+int ApplyFromSdcard(Device* device, RecoveryUI* ui) {
+  if (ensure_path_mounted(SDCARD_ROOT) != 0) {
+    LOG(ERROR) << "\n-- Couldn't mount " << SDCARD_ROOT << ".\n";
+    return INSTALL_ERROR;
+  }
+
+  std::string path = BrowseDirectory(SDCARD_ROOT, device, ui);
+  if (path.empty()) {
+    LOG(ERROR) << "\n-- No package file selected.\n";
+    ensure_path_unmounted(SDCARD_ROOT);
+    return INSTALL_ERROR;
+  }
+
+  ui->Print("\n-- Install %s ...\n", path.c_str());
+  SetSdcardUpdateBootloaderMessage();
+
   // We used to use fuse in a thread as opposed to a process. Since accessing
   // through fuse involves going from kernel to userspace to kernel, it leads
   // to deadlock when a page fault occurs. (Bug: 26313124)
   pid_t child;
   if ((child = fork()) == 0) {
-    bool status = StartInstallPackageFuse(path);
+    bool status = StartSdcardFuse(path);
 
     _exit(status ? EXIT_SUCCESS : EXIT_FAILURE);
   }
 
-  // FUSE_SIDELOAD_HOST_PATHNAME will start to exist once the fuse in child process is ready.
-  InstallResult result = INSTALL_ERROR;
+  // FUSE_SIDELOAD_HOST_PATHNAME will start to exist once the fuse in child
+  // process is ready.
+  int result = INSTALL_ERROR;
   int status;
   bool waited = false;
   for (int i = 0; i < SDCARD_INSTALL_TIMEOUT; ++i) {
@@ -180,11 +183,8 @@ InstallResult InstallWithFuseFromPath(std::string_view path, RecoveryUI* ui) {
         break;
       }
     }
-    auto package =
-        Package::CreateFilePackage(FUSE_SIDELOAD_HOST_PATHNAME,
-                                   std::bind(&RecoveryUI::SetProgress, ui, std::placeholders::_1));
-    result =
-        InstallPackage(package.get(), FUSE_SIDELOAD_HOST_PATHNAME, false, 0 /* retry_count */, ui);
+
+    result = install_package(FUSE_SIDELOAD_HOST_PATHNAME, false, false, 0 /*retry_count*/, ui);
     break;
   }
 
@@ -201,32 +201,6 @@ InstallResult InstallWithFuseFromPath(std::string_view path, RecoveryUI* ui) {
     LOG(ERROR) << "Error exit from the fuse process: " << WEXITSTATUS(status);
   }
 
-  return result;
-}
-
-InstallResult ApplyFromSdcard(Device* device) {
-  auto ui = device->GetUI();
-  if (ensure_path_mounted(SDCARD_ROOT) != 0) {
-    LOG(ERROR) << "\n-- Couldn't mount " << SDCARD_ROOT << ".\n";
-    return INSTALL_ERROR;
-  }
-
-  std::string path = BrowseDirectory(SDCARD_ROOT, device, ui);
-  if (path.empty()) {
-    LOG(ERROR) << "\n-- No package file selected.\n";
-    ensure_path_unmounted(SDCARD_ROOT);
-    return INSTALL_ERROR;
-  }
-
-  // Hint the install function to read from a block map file.
-  if (android::base::EndsWithIgnoreCase(path, ".map")) {
-    path = "@" + path;
-  }
-
-  ui->Print("\n-- Install %s ...\n", path.c_str());
-  SetSdcardUpdateBootloaderMessage();
-
-  auto result = InstallWithFuseFromPath(path, ui);
   ensure_path_unmounted(SDCARD_ROOT);
   return result;
 }

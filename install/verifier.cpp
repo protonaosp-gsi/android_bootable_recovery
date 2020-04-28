@@ -311,7 +311,8 @@ int verify_file(VerifierInterface* package, const std::vector<Certificate>& keys
 
 static std::vector<Certificate> IterateZipEntriesAndSearchForKeys(const ZipArchiveHandle& handle) {
   void* cookie;
-  int32_t iter_status = StartIteration(handle, &cookie, "", "x509.pem");
+  ZipString suffix("x509.pem");
+  int32_t iter_status = StartIteration(handle, &cookie, nullptr, &suffix);
   if (iter_status != 0) {
     LOG(ERROR) << "Failed to iterate over entries in the certificate zipfile: "
                << ErrorCodeString(iter_status);
@@ -320,21 +321,22 @@ static std::vector<Certificate> IterateZipEntriesAndSearchForKeys(const ZipArchi
 
   std::vector<Certificate> result;
 
-  std::string_view name;
+  ZipString name;
   ZipEntry entry;
   while ((iter_status = Next(cookie, &entry, &name)) == 0) {
     std::vector<uint8_t> pem_content(entry.uncompressed_length);
     if (int32_t extract_status =
             ExtractToMemory(handle, &entry, pem_content.data(), pem_content.size());
         extract_status != 0) {
-      LOG(ERROR) << "Failed to extract " << name;
+      LOG(ERROR) << "Failed to extract " << std::string(name.name, name.name + name.name_length);
       return {};
     }
 
     Certificate cert(0, Certificate::KEY_TYPE_RSA, nullptr, nullptr);
     // Aborts the parsing if we fail to load one of the key file.
     if (!LoadCertificateFromBuffer(pem_content, &cert)) {
-      LOG(ERROR) << "Failed to load keys from " << name;
+      LOG(ERROR) << "Failed to load keys from "
+                 << std::string(name.name, name.name + name.name_length);
       return {};
     }
 

@@ -26,10 +26,6 @@ cc_defaults {
     include_dirs: [
         "system/core/adb",
     ],
-
-    header_libs: [
-        "libminadbd_headers",
-    ],
 }
 
 // `libminadbd_services` is analogous to the `libadbd_services` for regular `adbd`, but providing
@@ -40,17 +36,11 @@ cc_library {
 
     defaults: [
         "minadbd_defaults",
-        "librecovery_utils_defaults",
     ],
 
     srcs: [
         "fuse_adb_provider.cpp",
         "minadbd_services.cpp",
-    ],
-
-    static_libs: [
-        "librecovery_utils",
-        "libotautil",
     ],
 
     shared_libs: [
@@ -64,12 +54,9 @@ cc_library {
 cc_library_headers {
     name: "libminadbd_headers",
     recovery_available: true,
+    // TODO create a include dir
     export_include_dirs: [
-        "include",
-    ],
-    // adb_install.cpp
-    visibility: [
-        "//bootable/recovery/install",
+        ".",
     ],
 }
 
@@ -91,10 +78,6 @@ cc_binary {
         "libcrypto",
         "libminadbd_services",
     ],
-
-    required: [
-        "adbd_system_binaries_recovery",
-    ]
 }
 
 cc_test {
@@ -103,7 +86,6 @@ cc_test {
 
     defaults: [
         "minadbd_defaults",
-        "librecovery_utils_defaults",
     ],
 
     srcs: [
@@ -114,14 +96,12 @@ cc_test {
     static_libs: [
         "libminadbd_services",
         "libfusesideload",
-        "librecovery_utils",
-        "libotautil",
         "libadbd",
+        "libcrypto",
     ],
 
     shared_libs: [
         "libbase",
-        "libcrypto",
         "libcutils",
         "liblog",
     ],

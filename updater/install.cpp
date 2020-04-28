@@ -53,30 +53,45 @@
 #include <openssl/sha.h>
 #include <selinux/label.h>
 #include <selinux/selinux.h>
+#include <tune2fs.h>
 #include <ziparchive/zip_archive.h>
 
 #include "edify/expr.h"
-#include "edify/updater_interface.h"
-#include "edify/updater_runtime_interface.h"
 #include "otautil/dirutil.h"
 #include "otautil/error_code.h"
+#include "otautil/mounts.h"
 #include "otautil/print_sha1.h"
 #include "otautil/sysutil.h"
+#include "updater/updater.h"
 
-#ifndef __ANDROID__
-#include <cutils/memory.h>  // for strlcpy
-#endif
+// Send over the buffer to recovery though the command pipe.
+static void uiPrint(State* state, const std::string& buffer) {
+  UpdaterInfo* ui = static_cast<UpdaterInfo*>(state->cookie);
 
-static bool UpdateBlockDeviceNameForPartition(UpdaterInterface* updater, Partition* partition) {
-  CHECK(updater);
-  std::string name = updater->FindBlockDeviceName(partition->name);
-  if (name.empty()) {
-    LOG(ERROR) << "Failed to find the block device " << partition->name;
-    return false;
+  // "line1\nline2\n" will be split into 3 tokens: "line1", "line2" and "".
+  // So skip sending empty strings to UI.
+  std::vector<std::string> lines = android::base::Split(buffer, "\n");
+  for (auto& line : lines) {
+    if (!line.empty()) {
+      fprintf(ui->cmd_pipe, "ui_print %s\n", line.c_str());
+    }
   }
 
-  partition->name = std::move(name);
-  return true;
+  // On the updater side, we need to dump the contents to stderr (which has
+  // been redirected to the log file). Because the recovery will only print
+  // the contents to screen when processing pipe command ui_print.
+  LOG(INFO) << buffer;
+}
+
+void uiPrintf(State* _Nonnull state, const char* _Nonnull format, ...) {
+  std::string error_msg;
+
+  va_list ap;
+  va_start(ap, format);
+  android::base::StringAppendV(&error_msg, format, ap);
+  va_end(ap);
+
+  uiPrint(state, error_msg);
 }
 
 // This is the updater side handler for ui_print() in edify script. Contents will be sent over to
@@ -88,7 +103,7 @@ Value* UIPrintFn(const char* name, State* state, const std::vector<std::unique_p
   }
 
   std::string buffer = android::base::Join(args, "");
-  state->updater->UiPrint(buffer);
+  uiPrint(state, buffer);
   return StringValue(buffer);
 }
 
@@ -112,20 +127,14 @@ Value* PackageExtractFileFn(const char* name, State* state,
                         argv.size());
     }
     const std::string& zip_path = args[0];
-    std::string dest_path = args[1];
+    const std::string& dest_path = args[1];
 
-    ZipArchiveHandle za = state->updater->GetPackageHandle();
+    ZipArchiveHandle za = static_cast<UpdaterInfo*>(state->cookie)->package_zip;
+    ZipString zip_string_path(zip_path.c_str());
     ZipEntry entry;
-    if (FindEntry(za, zip_path, &entry) != 0) {
+    if (FindEntry(za, zip_string_path, &entry) != 0) {
       LOG(ERROR) << name << ": no " << zip_path << " in package";
       return StringValue("");
-    }
-
-    // Update the destination of package_extract_file if it's a block device. During simulation the
-    // destination will map to a fake file.
-    if (std::string block_device_name = state->updater->FindBlockDeviceName(dest_path);
-        !block_device_name.empty()) {
-      dest_path = block_device_name;
     }
 
     android::base::unique_fd fd(TEMP_FAILURE_RETRY(
@@ -164,9 +173,10 @@ Value* PackageExtractFileFn(const char* name, State* state,
     }
     const std::string& zip_path = args[0];
 
-    ZipArchiveHandle za = state->updater->GetPackageHandle();
+    ZipArchiveHandle za = static_cast<UpdaterInfo*>(state->cookie)->package_zip;
+    ZipString zip_string_path(zip_path.c_str());
     ZipEntry entry;
-    if (FindEntry(za, zip_path, &entry) != 0) {
+    if (FindEntry(za, zip_string_path, &entry) != 0) {
       return ErrorAbort(state, kPackageExtractFileFailure, "%s(): no %s in package", name,
                         zip_path.c_str());
     }
@@ -219,11 +229,6 @@ Value* PatchPartitionCheckFn(const char* name, State* state,
                       args[1].c_str(), err.c_str());
   }
 
-  if (!UpdateBlockDeviceNameForPartition(state->updater, &source) ||
-      !UpdateBlockDeviceNameForPartition(state->updater, &target)) {
-    return StringValue("");
-  }
-
   bool result = PatchPartitionCheck(target, source);
   return StringValue(result ? "t" : "");
 }
@@ -265,12 +270,7 @@ Value* PatchPartitionFn(const char* name, State* state,
     return ErrorAbort(state, kArgsParsingFailure, "%s(): Invalid patch arg", name);
   }
 
-  if (!UpdateBlockDeviceNameForPartition(state->updater, &source) ||
-      !UpdateBlockDeviceNameForPartition(state->updater, &target)) {
-    return StringValue("");
-  }
-
-  bool result = PatchPartition(target, source, *values[0], nullptr, true);
+  bool result = PatchPartition(target, source, *values[0], nullptr);
   return StringValue(result ? "t" : "");
 }
 
@@ -313,11 +313,26 @@ Value* MountFn(const char* name, State* state, const std::vector<std::unique_ptr
                       name);
   }
 
-  auto updater = state->updater;
-  if (updater->GetRuntime()->Mount(location, mount_point, fs_type, mount_options) != 0) {
-    updater->UiPrint(android::base::StringPrintf("%s: Failed to mount %s at %s: %s", name,
-                                                 location.c_str(), mount_point.c_str(),
-                                                 strerror(errno)));
+  {
+    char* secontext = nullptr;
+
+    if (sehandle) {
+      selabel_lookup(sehandle, &secontext, mount_point.c_str(), 0755);
+      setfscreatecon(secontext);
+    }
+
+    mkdir(mount_point.c_str(), 0755);
+
+    if (secontext) {
+      freecon(secontext);
+      setfscreatecon(nullptr);
+    }
+  }
+
+  if (mount(location.c_str(), mount_point.c_str(), fs_type.c_str(),
+            MS_NOATIME | MS_NODEV | MS_NODIRATIME, mount_options.c_str()) < 0) {
+    uiPrintf(state, "%s: Failed to mount %s at %s: %s", name, location.c_str(), mount_point.c_str(),
+             strerror(errno));
     return StringValue("");
   }
 
@@ -340,8 +355,9 @@ Value* IsMountedFn(const char* name, State* state, const std::vector<std::unique
                       "mount_point argument to unmount() can't be empty");
   }
 
-  auto updater_runtime = state->updater->GetRuntime();
-  if (!updater_runtime->IsMounted(mount_point)) {
+  scan_mounted_volumes();
+  MountedVolume* vol = find_mounted_volume_by_mount_point(mount_point.c_str());
+  if (vol == nullptr) {
     return StringValue("");
   }
 
@@ -362,18 +378,37 @@ Value* UnmountFn(const char* name, State* state, const std::vector<std::unique_p
                       "mount_point argument to unmount() can't be empty");
   }
 
-  auto updater = state->updater;
-  auto [mounted, result] = updater->GetRuntime()->Unmount(mount_point);
-  if (!mounted) {
-    updater->UiPrint(
-        android::base::StringPrintf("Failed to unmount %s: No such volume", mount_point.c_str()));
+  scan_mounted_volumes();
+  MountedVolume* vol = find_mounted_volume_by_mount_point(mount_point.c_str());
+  if (vol == nullptr) {
+    uiPrintf(state, "Failed to unmount %s: No such volume", mount_point.c_str());
     return nullptr;
-  } else if (result != 0) {
-    updater->UiPrint(android::base::StringPrintf("Failed to unmount %s: %s", mount_point.c_str(),
-                                                 strerror(errno)));
+  } else {
+    int ret = unmount_mounted_volume(vol);
+    if (ret != 0) {
+      uiPrintf(state, "Failed to unmount %s: %s", mount_point.c_str(), strerror(errno));
+    }
   }
 
   return StringValue(mount_point);
+}
+
+static int exec_cmd(const std::vector<std::string>& args) {
+  CHECK(!args.empty());
+  auto argv = StringVectorToNullTerminatedArray(args);
+
+  pid_t child;
+  if ((child = vfork()) == 0) {
+    execv(argv[0], argv.data());
+    _exit(EXIT_FAILURE);
+  }
+
+  int status;
+  waitpid(child, &status, 0);
+  if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+    LOG(ERROR) << args[0] << " failed with status " << WEXITSTATUS(status);
+  }
+  return WEXITSTATUS(status);
 }
 
 // format(fs_type, partition_type, location, fs_size, mount_point)
@@ -420,7 +455,6 @@ Value* FormatFn(const char* name, State* state, const std::vector<std::unique_pt
                       fs_size.c_str());
   }
 
-  auto updater_runtime = state->updater->GetRuntime();
   if (fs_type == "ext4") {
     std::vector<std::string> mke2fs_args = {
       "/system/bin/mke2fs", "-t", "ext4", "-b", "4096", location
@@ -429,13 +463,12 @@ Value* FormatFn(const char* name, State* state, const std::vector<std::unique_pt
       mke2fs_args.push_back(std::to_string(size / 4096LL));
     }
 
-    if (auto status = updater_runtime->RunProgram(mke2fs_args, true); status != 0) {
+    if (auto status = exec_cmd(mke2fs_args); status != 0) {
       LOG(ERROR) << name << ": mke2fs failed (" << status << ") on " << location;
       return StringValue("");
     }
 
-    if (auto status = updater_runtime->RunProgram(
-            { "/system/bin/e2fsdroid", "-e", "-a", mount_point, location }, true);
+    if (auto status = exec_cmd({ "/system/bin/e2fsdroid", "-e", "-a", mount_point, location });
         status != 0) {
       LOG(ERROR) << name << ": e2fsdroid failed (" << status << ") on " << location;
       return StringValue("");
@@ -454,13 +487,12 @@ Value* FormatFn(const char* name, State* state, const std::vector<std::unique_pt
     if (size >= 512) {
       f2fs_args.push_back(std::to_string(size / 512));
     }
-    if (auto status = updater_runtime->RunProgram(f2fs_args, true); status != 0) {
+    if (auto status = exec_cmd(f2fs_args); status != 0) {
       LOG(ERROR) << name << ": make_f2fs failed (" << status << ") on " << location;
       return StringValue("");
     }
 
-    if (auto status = updater_runtime->RunProgram(
-            { "/system/bin/sload_f2fs", "-t", mount_point, location }, true);
+    if (auto status = exec_cmd({ "/system/bin/sload_f2fs", "-t", mount_point, location });
         status != 0) {
       LOG(ERROR) << name << ": sload_f2fs failed (" << status << ") on " << location;
       return StringValue("");
@@ -499,7 +531,8 @@ Value* ShowProgressFn(const char* name, State* state,
                       sec_str.c_str());
   }
 
-  state->updater->WriteToCommandPipe(android::base::StringPrintf("progress %f %d", frac, sec));
+  UpdaterInfo* ui = static_cast<UpdaterInfo*>(state->cookie);
+  fprintf(ui->cmd_pipe, "progress %f %d\n", frac, sec);
 
   return StringValue(frac_str);
 }
@@ -522,7 +555,8 @@ Value* SetProgressFn(const char* name, State* state,
                       frac_str.c_str());
   }
 
-  state->updater->WriteToCommandPipe(android::base::StringPrintf("set_progress %f", frac));
+  UpdaterInfo* ui = static_cast<UpdaterInfo*>(state->cookie);
+  fprintf(ui->cmd_pipe, "set_progress %f\n", frac);
 
   return StringValue(frac_str);
 }
@@ -535,9 +569,7 @@ Value* GetPropFn(const char* name, State* state, const std::vector<std::unique_p
   if (!Evaluate(state, argv[0], &key)) {
     return nullptr;
   }
-
-  auto updater_runtime = state->updater->GetRuntime();
-  std::string value = updater_runtime->GetProperty(key, "");
+  std::string value = android::base::GetProperty(key, "");
 
   return StringValue(value);
 }
@@ -562,8 +594,7 @@ Value* FileGetPropFn(const char* name, State* state,
   const std::string& key = args[1];
 
   std::string buffer;
-  auto updater_runtime = state->updater->GetRuntime();
-  if (!updater_runtime->ReadFileToString(filename, &buffer)) {
+  if (!android::base::ReadFileToString(filename, &buffer)) {
     ErrorAbort(state, kFreadFailure, "%s: failed to read %s", name, filename.c_str());
     return nullptr;
   }
@@ -624,8 +655,7 @@ Value* WipeCacheFn(const char* name, State* state, const std::vector<std::unique
     return ErrorAbort(state, kArgsParsingFailure, "%s() expects no args, got %zu", name,
                       argv.size());
   }
-
-  state->updater->WriteToCommandPipe("wipe_cache");
+  fprintf(static_cast<UpdaterInfo*>(state->cookie)->cmd_pipe, "wipe_cache\n");
   return StringValue("t");
 }
 
@@ -639,8 +669,26 @@ Value* RunProgramFn(const char* name, State* state, const std::vector<std::uniqu
     return ErrorAbort(state, kArgsParsingFailure, "%s() Failed to parse the argument(s)", name);
   }
 
-  auto updater_runtime = state->updater->GetRuntime();
-  auto status = updater_runtime->RunProgram(args, false);
+  auto exec_args = StringVectorToNullTerminatedArray(args);
+  LOG(INFO) << "about to run program [" << exec_args[0] << "] with " << argv.size() << " args";
+
+  pid_t child = fork();
+  if (child == 0) {
+    execv(exec_args[0], exec_args.data());
+    PLOG(ERROR) << "run_program: execv failed";
+    _exit(EXIT_FAILURE);
+  }
+
+  int status;
+  waitpid(child, &status, 0);
+  if (WIFEXITED(status)) {
+    if (WEXITSTATUS(status) != 0) {
+      LOG(ERROR) << "run_program: child exited with status " << WEXITSTATUS(status);
+    }
+  } else if (WIFSIGNALED(status)) {
+    LOG(ERROR) << "run_program: child terminated by signal " << WTERMSIG(status);
+  }
+
   return StringValue(std::to_string(status));
 }
 
@@ -658,8 +706,7 @@ Value* ReadFileFn(const char* name, State* state, const std::vector<std::unique_
   const std::string& filename = args[0];
 
   std::string contents;
-  auto updater_runtime = state->updater->GetRuntime();
-  if (updater_runtime->ReadFileToString(filename, &contents)) {
+  if (android::base::ReadFileToString(filename, &contents)) {
     return new Value(Value::Type::STRING, std::move(contents));
   }
 
@@ -688,12 +735,12 @@ Value* WriteValueFn(const char* name, State* state, const std::vector<std::uniqu
   }
 
   const std::string& value = args[0];
-  auto updater_runtime = state->updater->GetRuntime();
-  if (!updater_runtime->WriteStringToFile(value, filename)) {
+  if (!android::base::WriteStringToFile(value, filename)) {
     PLOG(ERROR) << name << ": Failed to write to \"" << filename << "\"";
     return StringValue("");
+  } else {
+    return StringValue("t");
   }
-  return StringValue("t");
 }
 
 // Immediately reboot the device.  Recovery is not finished normally,
@@ -731,7 +778,7 @@ Value* RebootNowFn(const char* name, State* state, const std::vector<std::unique
     return StringValue("");
   }
 
-  Reboot(property);
+  reboot("reboot," + property);
 
   sleep(5);
   return ErrorAbort(state, kRebootFailure, "%s() failed to reboot", name);
@@ -819,10 +866,16 @@ Value* WipeBlockDeviceFn(const char* name, State* state, const std::vector<std::
   if (!android::base::ParseUint(len_str.c_str(), &len)) {
     return nullptr;
   }
+  android::base::unique_fd fd(open(filename.c_str(), O_WRONLY));
+  if (fd == -1) {
+    PLOG(ERROR) << "Failed to open " << filename;
+    return StringValue("");
+  }
 
-  auto updater_runtime = state->updater->GetRuntime();
-  int status = updater_runtime->WipeBlockDevice(filename, len);
-  return StringValue(status == 0 ? "t" : "");
+  // The wipe_block_device function in ext4_utils returns 0 on success and 1
+  // for failure.
+  int status = wipe_block_device(fd, len);
+  return StringValue((status == 0) ? "t" : "");
 }
 
 Value* EnableRebootFn(const char* name, State* state, const std::vector<std::unique_ptr<Expr>>& argv) {
@@ -830,7 +883,8 @@ Value* EnableRebootFn(const char* name, State* state, const std::vector<std::uni
     return ErrorAbort(state, kArgsParsingFailure, "%s() expects no args, got %zu", name,
                       argv.size());
   }
-  state->updater->WriteToCommandPipe("enable_reboot");
+  UpdaterInfo* ui = static_cast<UpdaterInfo*>(state->cookie);
+  fprintf(ui->cmd_pipe, "enable_reboot\n");
   return StringValue("t");
 }
 
@@ -846,8 +900,10 @@ Value* Tune2FsFn(const char* name, State* state, const std::vector<std::unique_p
 
   // tune2fs expects the program name as its first arg.
   args.insert(args.begin(), "tune2fs");
-  auto updater_runtime = state->updater->GetRuntime();
-  if (auto result = updater_runtime->Tune2Fs(args); result != 0) {
+  auto tune2fs_args = StringVectorToNullTerminatedArray(args);
+
+  // tune2fs changes the filesystem parameters on an ext2 filesystem; it returns 0 on success.
+  if (auto result = tune2fs_main(tune2fs_args.size() - 1, tune2fs_args.data()); result != 0) {
     return ErrorAbort(state, kTune2FsFailure, "%s() returned error code %d", name, result);
   }
   return StringValue("t");

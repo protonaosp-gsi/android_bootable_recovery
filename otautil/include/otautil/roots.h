@@ -54,5 +54,6 @@ int format_volume(const std::string& volume, const std::string& directory);
 // mounted (/tmp and /cache) are mounted.  Returns 0 on success.
 int setup_install_mounts();
 
-// Returns true if there is /cache in the volumes.
-bool HasCache();
+bool logical_partitions_mapped();
+
+std::string get_system_root();

@@ -50,11 +50,13 @@ cc_defaults {
     },
 }
 
-// libapplypatch, libapplypatch_modes
+// libapplypatch, libapplypatch_modes, libimgdiff, libimgpatch
 libapplypatch_static_libs = [
     "libapplypatch_modes",
     "libapplypatch",
     "libedify",
+    "libimgdiff",
+    "libimgpatch",
     "libotautil",
     "libbsdiff",
     "libbspatch",
@@ -64,6 +66,7 @@ libapplypatch_static_libs = [
     "libbase",
     "libbrotli",
     "libbz",
+    "libcrypto",
     "libz",
     "libziparchive",
 ]
@@ -76,8 +79,6 @@ librecovery_static_libs = [
     "libinstall",
     "librecovery_ui",
     "libminui",
-    "libfusesideload",
-    "libbootloader_message",
     "libotautil",
 
     "libhealthhalutils",
@@ -86,25 +87,27 @@ librecovery_static_libs = [
 
     "android.hardware.health@2.0",
     "android.hardware.health@1.0",
+    "libbootloader_message",
     "libext4_utils",
     "libfs_mgr",
+    "libfusesideload",
     "libhidl-gen-utils",
     "libhidlbase",
+    "libhidltransport",
+    "libhwbinder_noltopgo",
     "libbinderthreadstate",
     "liblp",
     "libvndksupport",
     "libtinyxml2",
+    "libc++fs",
 ]
 
 cc_test {
     name: "recovery_unit_test",
     isolated: true,
-    require_root: true,
 
     defaults: [
         "recovery_test_defaults",
-        "libupdater_defaults",
-        "libupdater_device_defaults",
     ],
 
     test_suites: ["device-tests"],
@@ -113,24 +116,16 @@ cc_test {
         "unit/*.cpp",
     ],
 
-    static_libs: libapplypatch_static_libs + librecovery_static_libs + [
+    static_libs: libapplypatch_static_libs + [
+        "libinstall",
         "librecovery_ui",
-        "libfusesideload",
         "libminui",
-        "librecovery_utils",
         "libotautil",
-        "libupdater_device",
-        "libupdater_core",
-        "libupdate_verifier",
-
+        "libupdater",
         "libgtest_prod",
-        "libprotobuf-cpp-lite",
     ],
 
-    data: [
-        "testdata/*",
-        ":res-testdata",
-    ],
+    data: ["testdata/*"],
 }
 
 cc_test {
@@ -148,8 +143,8 @@ cc_test {
     ],
 }
 
-cc_test_host {
-    name: "recovery_host_test",
+cc_test {
+    name: "recovery_component_test",
     isolated: true,
 
     defaults: [
@@ -157,28 +152,57 @@ cc_test_host {
         "libupdater_defaults",
     ],
 
+    test_suites: ["device-tests"],
+
     srcs: [
-        "unit/host/*",
+        "component/*.cpp",
+    ],
+
+    static_libs: libapplypatch_static_libs + librecovery_static_libs + [
+        "libupdater",
+        "libupdate_verifier",
+        "libprotobuf-cpp-lite",
+    ],
+
+    data: [
+        "testdata/*",
+        ":res-testdata",
+    ],
+}
+
+cc_test_host {
+    name: "recovery_host_test",
+    isolated: true,
+
+    defaults: [
+        "recovery_test_defaults",
+    ],
+
+    srcs: [
+        "component/imgdiff_test.cpp",
     ],
 
     static_libs: [
-        "libupdater_host",
-        "libupdater_core",
         "libimgdiff",
+        "libimgpatch",
+        "libotautil",
         "libbsdiff",
+        "libbspatch",
+        "libziparchive",
+        "libutils",
+        "libcrypto",
+        "libbrotli",
+        "libbz",
         "libdivsufsort64",
         "libdivsufsort",
-        "libfstab",
-        "libc++fs",
+        "libz",
     ],
-
-    test_suites: ["general-tests"],
 
     data: ["testdata/*"],
 
     target: {
         darwin: {
-            // libapplypatch in "libupdater_defaults" is not available on the Mac.
+            // libimgdiff is not available on the Mac.
             enabled: false,
         },
     },
