@@ -30,6 +30,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <filesystem>
 #include <functional>
 #include <limits>
 #include <mutex>
@@ -66,8 +67,11 @@ static_assert(kRecoveryApiVersion == RECOVERY_API_VERSION, "Mismatching recovery
 // Default allocation of progress bar segments to operations
 static constexpr int VERIFICATION_PROGRESS_TIME = 60;
 static constexpr float VERIFICATION_PROGRESS_FRACTION = 0.25;
-
+// The charater used to separate dynamic fingerprints. e.x. sargo|aosp-sargo
+static const char* FINGERPRING_SEPARATOR = "|";
 static std::condition_variable finish_log_temperature;
+static bool isInStringList(const std::string& target_token, const std::string& str_list,
+                           const std::string& deliminator);
 
 bool ReadMetadataFromPackage(ZipArchiveHandle zip, std::map<std::string, std::string>* metadata) {
   CHECK(metadata != nullptr);
@@ -150,7 +154,8 @@ static bool CheckAbSpecificMetadata(const std::map<std::string, std::string>& me
 
   auto device_fingerprint = android::base::GetProperty("ro.build.fingerprint", "");
   auto pkg_pre_build_fingerprint = get_value(metadata, "pre-build");
-  if (!pkg_pre_build_fingerprint.empty() && pkg_pre_build_fingerprint != device_fingerprint) {
+  if (!pkg_pre_build_fingerprint.empty() &&
+      !isInStringList(device_fingerprint, pkg_pre_build_fingerprint, FINGERPRING_SEPARATOR)) {
     LOG(ERROR) << "Package is for source build " << pkg_pre_build_fingerprint << " but expected "
                << device_fingerprint;
     return false;
@@ -198,7 +203,8 @@ bool CheckPackageMetadata(const std::map<std::string, std::string>& metadata, Ot
 
   auto device = android::base::GetProperty("ro.product.device", "");
   auto pkg_device = get_value(metadata, "pre-device");
-  if (pkg_device != device || pkg_device.empty()) {
+  // device name can be a | separated list, so need to check
+  if (pkg_device.empty() || !isInStringList(device, pkg_device, FINGERPRING_SEPARATOR)) {
     LOG(ERROR) << "Package is for product " << pkg_device << " but expected " << device;
     return false;
   }
@@ -651,4 +657,65 @@ bool verify_package(Package* package, RecoveryUI* ui) {
     return false;
   }
   return true;
+}
+
+bool SetupPackageMount(const std::string& package_path, bool* should_use_fuse) {
+  CHECK(should_use_fuse != nullptr);
+
+  if (package_path.empty()) {
+    return false;
+  }
+
+  *should_use_fuse = true;
+  if (package_path[0] == '@') {
+    auto block_map_path = package_path.substr(1);
+    if (ensure_path_mounted(block_map_path) != 0) {
+      LOG(ERROR) << "Failed to mount " << block_map_path;
+      return false;
+    }
+    // uncrypt only produces block map only if the package stays on /data.
+    *should_use_fuse = false;
+    return true;
+  }
+
+  // Package is not a block map file.
+  if (ensure_path_mounted(package_path) != 0) {
+    LOG(ERROR) << "Failed to mount " << package_path;
+    return false;
+  }
+
+  // Reject the package if the input path doesn't equal the canonicalized path.
+  // e.g. /cache/../sdcard/update_package.
+  std::error_code ec;
+  auto canonical_path = std::filesystem::canonical(package_path, ec);
+  if (ec) {
+    LOG(ERROR) << "Failed to get canonical of " << package_path << ", " << ec.message();
+    return false;
+  }
+  if (canonical_path.string() != package_path) {
+    LOG(ERROR) << "Installation aborts. The canonical path " << canonical_path.string()
+               << " doesn't equal the original path " << package_path;
+    return false;
+  }
+
+  constexpr const char* CACHE_ROOT = "/cache";
+  if (android::base::StartsWith(package_path, CACHE_ROOT)) {
+    *should_use_fuse = false;
+  }
+  return true;
+}
+
+// Check if `target_token` is in string `str_list`, where `str_list` is expected to be a
+// list delimited by `deliminator`
+// E.X. isInStringList("a", "a|b|c|d", "|") => true
+// E.X. isInStringList("abc", "abc", "|") => true
+static bool isInStringList(const std::string& target_token, const std::string& str_list,
+                           const std::string& deliminator) {
+  if (target_token.length() > str_list.length()) {
+    return false;
+  } else if (target_token.length() == str_list.length() || deliminator.length() == 0) {
+    return target_token == str_list;
+  }
+  auto&& list = android::base::Split(str_list, deliminator);
+  return std::find(list.begin(), list.end(), target_token) != list.end();
 }

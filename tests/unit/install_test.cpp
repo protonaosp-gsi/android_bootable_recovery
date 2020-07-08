@@ -35,6 +35,7 @@
 #include "install/wipe_device.h"
 #include "otautil/paths.h"
 #include "private/setup_commands.h"
+#include "recovery_utils/roots.h"
 
 static void BuildZipArchive(const std::map<std::string, std::string>& file_map, int fd,
                             int compression_type) {
@@ -465,6 +466,34 @@ TEST(InstallTest, CheckPackageMetadata_ab_fingerprint) {
   TestCheckPackageMetadata(metadata, OtaType::AB, false);
 }
 
+TEST(InstallTest, CheckPackageMetadata_dynamic_fingerprint) {
+  std::string device = android::base::GetProperty("ro.product.device", "");
+  ASSERT_FALSE(device.empty());
+
+  std::string finger_print = android::base::GetProperty("ro.build.fingerprint", "");
+  ASSERT_FALSE(finger_print.empty());
+
+  std::string metadata = android::base::Join(
+      std::vector<std::string>{
+          "ota-type=AB",
+          "pre-device=please|work|" + device + "|please|work",
+          "pre-build=" + finger_print = "pass|this|test",
+          "post-timestamp=" + std::to_string(std::numeric_limits<int64_t>::max()),
+      },
+      "\n");
+  TestCheckPackageMetadata(metadata, OtaType::AB, true);
+
+  metadata = android::base::Join(
+      std::vector<std::string>{
+          "ota-type=AB",
+          "pre-device=" + device,
+          "pre-build=dummy_build_fingerprint",
+          "post-timestamp=" + std::to_string(std::numeric_limits<int64_t>::max()),
+      },
+      "\n");
+  TestCheckPackageMetadata(metadata, OtaType::AB, false);
+}
+
 TEST(InstallTest, CheckPackageMetadata_ab_post_timestamp) {
   std::string device = android::base::GetProperty("ro.product.device", "");
   ASSERT_NE("", device);
@@ -512,4 +541,31 @@ TEST(InstallTest, CheckPackageMetadata_ab_post_timestamp) {
       },
       "\n");
   TestCheckPackageMetadata(metadata, OtaType::AB, true);
+}
+
+TEST(InstallTest, SetupPackageMount_package_path) {
+  load_volume_table();
+  bool install_with_fuse;
+
+  // Setup should fail if the input path doesn't exist.
+  ASSERT_FALSE(SetupPackageMount("/does_not_exist", &install_with_fuse));
+
+  // Package should be installed with fuse if it's not in /cache.
+  TemporaryDir temp_dir;
+  TemporaryFile update_package(temp_dir.path);
+  ASSERT_TRUE(SetupPackageMount(update_package.path, &install_with_fuse));
+  ASSERT_TRUE(install_with_fuse);
+
+  // Setup should fail if the input path isn't canonicalized.
+  std::string uncanonical_package_path = android::base::Join(
+      std::vector<std::string>{
+          temp_dir.path,
+          "..",
+          android::base::Basename(temp_dir.path),
+          android::base::Basename(update_package.path),
+      },
+      '/');
+
+  ASSERT_EQ(0, access(uncanonical_package_path.c_str(), R_OK));
+  ASSERT_FALSE(SetupPackageMount(uncanonical_package_path, &install_with_fuse));
 }
