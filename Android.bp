@@ -78,6 +78,7 @@ cc_defaults {
         "libminui",
         "librecovery_utils",
         "libotautil",
+        "libsnapshot_cow",
         "libsnapshot_nobinder",
         "update_metadata-protos",
     ],
@@ -96,7 +97,6 @@ cc_library_static {
     ],
 
     shared_libs: [
-        "libfusesideload",
         "librecovery_ui",
     ],
 }
