@@ -31,7 +31,6 @@ cc_defaults {
         "libpng",
         "libprocessgroup",
         "libselinux",
-        "libz",
         "libziparchive",
     ],
 
@@ -65,7 +64,7 @@ libapplypatch_static_libs = [
     "libbase",
     "libbrotli",
     "libbz",
-    "libz",
+    "libz_stable",
     "libziparchive",
 ]
 
@@ -200,4 +199,24 @@ cc_test_host {
             enabled: false,
         },
     },
+}
+
+cc_fuzz {
+    name: "libinstall_verify_package_fuzzer",
+    defaults: [
+        "recovery_test_defaults",
+    ],
+
+    srcs: ["fuzz/verify_package_fuzzer.cpp"],
+
+    corpus: [
+      "testdata/otasigned*.zip",
+    ],
+
+    static_libs: [
+        "libotautil",
+        "libinstall",
+        "librecovery_ui",
+        "libminui",
+    ],
 }
